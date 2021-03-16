@@ -1,5 +1,6 @@
 using ..TestRequest
 using HTTP
+using Sockets
 using JSON
 using Test
 
@@ -213,6 +214,97 @@ end
 
 @testset "readtimeout" begin
     @test_throws HTTP.IOError HTTP.get("http://httpbin.org/delay/5"; readtimeout=1, retry=false)
+end
+
+@testset "Retry all resolved IP addresses" begin
+    # See issue https://github.com/JuliaWeb/HTTP.jl/issues/672
+    # Bit tricky to test, but can at least be tested if localhost
+    # resolves to both IPv4 and IPv6 by listening to the respective
+    # interface
+    alladdrs = getalladdrinfo("localhost")
+    if ip"127.0.0.1" in alladdrs && ip"::1" in alladdrs
+        for interface in (IPv4(0), IPv6(0))
+            server = listen(interface, 8080)
+            @async HTTP.listen(string(interface), 8080; server=server) do http
+                HTTP.setstatus(http, 200)
+                HTTP.startwrite(http)
+                HTTP.write(http, "hello, world")
+            end
+            req = HTTP.get("http://localhost:8080")
+            close(server)
+            @test req.status == 200
+            @test String(req.body) == "hello, world"
+        end
+    end
+end
+
+@testset "Implicit request headers" begin
+    server = listen(IPv4(0), 8080)
+    tsk = @async HTTP.listen("0.0.0.0", 8080; server=server) do http
+        data = Dict{String,String}(http.message.headers)
+        HTTP.setstatus(http, 200)
+        HTTP.startwrite(http)
+        HTTP.write(http, sprint(JSON.print, data))
+    end
+    old_user_agent = HTTP.MessageRequest.USER_AGENT[]
+    default_user_agent = "HTTP.jl/$VERSION"
+    # Default values
+    HTTP.setuseragent!(default_user_agent)
+    d = JSON.parse(IOBuffer(HTTP.get("http://localhost:8080").body))
+    @test d["Host"] == "localhost:8080"
+    @test d["Accept"] == "*/*"
+    @test d["User-Agent"] == default_user_agent
+    # Overwriting behavior
+    headers = ["Host" => "http.jl", "Accept" => "application/json"]
+    HTTP.setuseragent!("HTTP.jl test")
+    d = JSON.parse(IOBuffer(HTTP.get("http://localhost:8080", headers).body))
+    @test d["Host"] == "http.jl"
+    @test d["Accept"] == "application/json"
+    @test d["User-Agent"] == "HTTP.jl test"
+    # No User-Agent
+    HTTP.setuseragent!(nothing)
+    d = JSON.parse(IOBuffer(HTTP.get("http://localhost:8080").body))
+    @test !haskey(d, "User-Agent")
+
+    HTTP.setuseragent!(old_user_agent)
+    close(server)
+end
+
+import NetworkOptions, MbedTLS
+@testset "NetworkOptions for host verification" begin
+    # Set up server with self-signed cert
+    server = listen(IPv4(0), 8443)
+    cert, key = joinpath.(@__DIR__, "resources", ("cert.pem", "key.pem"))
+    sslconfig = MbedTLS.SSLConfig(cert, key)
+    tsk = @async HTTP.listen("0.0.0.0", 8443; server=server, sslconfig=sslconfig) do http
+        HTTP.setstatus(http, 200)
+        HTTP.startwrite(http)
+        HTTP.write(http, "hello, world")
+    end
+    url = "https://localhost:8443"
+    env = ["JULIA_NO_VERIFY_HOSTS" => nothing, "JULIA_SSL_NO_VERIFY_HOSTS" => nothing, "JULIA_ALWAYS_VERIFY_HOSTS" => nothing]
+    withenv(env...) do
+        @test NetworkOptions.verify_host(url)
+        @test NetworkOptions.verify_host(url, "SSL")
+        @test_throws HTTP.IOError HTTP.get(url; retries=1)
+        @test_throws HTTP.IOError HTTP.get(url; require_ssl_verification=true, retries=1)
+        @test HTTP.get(url; require_ssl_verification=false).status == 200
+    end
+    withenv(env..., "JULIA_NO_VERIFY_HOSTS" => "localhost") do
+        @test !NetworkOptions.verify_host(url)
+        @test !NetworkOptions.verify_host(url, "SSL")
+        @test HTTP.get(url).status == 200
+        @test_throws HTTP.IOError HTTP.get(url; require_ssl_verification=true, retries=1)
+        @test HTTP.get(url; require_ssl_verification=false).status == 200
+    end
+    withenv(env..., "JULIA_SSL_NO_VERIFY_HOSTS" => "localhost") do
+        @test NetworkOptions.verify_host(url)
+        @test !NetworkOptions.verify_host(url, "SSL")
+        @test HTTP.get(url).status == 200
+        @test_throws HTTP.IOError HTTP.get(url; require_ssl_verification=true, retries=1)
+        @test HTTP.get(url; require_ssl_verification=false).status == 200
+    end
+    close(server)
 end
 
 @testset "Public entry point of HTTP.request and friends (e.g. issue #463)" begin

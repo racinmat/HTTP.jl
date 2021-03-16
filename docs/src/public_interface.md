@@ -11,6 +11,15 @@ HTTP.post
 HTTP.head
 ```
 
+### Request body types
+
+```@docs
+HTTP.Form
+HTTP.Multipart
+```
+
+### Request exceptions
+
 Request functions may throw the following exceptions:
 
 ```@docs
@@ -18,18 +27,21 @@ HTTP.StatusError
 HTTP.ParseError
 HTTP.IOError
 ```
-```
+```@docs
 Sockets.DNSError
 ```
 
 ## URIs
 
+HTTP.jl uses the [URIs.jl](https://github.com/JuliaWeb/URIs.jl) package for handling
+URIs. Some functionality from URIs.jl, relevant to HTTP.jl, are listed below:
+
 ```@docs
-HTTP.URI
-HTTP.URIs.escapeuri
-HTTP.URIs.unescapeuri
-HTTP.URIs.splitpath
-Base.isvalid(::HTTP.URIs.URI)
+URI
+URIs.escapeuri
+URIs.unescapeuri
+URIs.splitpath
+Base.isvalid(::URIs.URI)
 ```
 
 
@@ -45,6 +57,7 @@ HTTP.Cookie
 ```@docs
 HTTP.sniff
 HTTP.Strings.escapehtml
+HTTP.statustext
 ```
 
 ## Server / Handlers
@@ -59,3 +72,16 @@ HTTP.StreamHandlerFunction
 HTTP.Router
 HTTP.@register
 ```
+
+## Messages Interface
+
+```@docs
+HTTP.Request
+HTTP.Response
+HTTP.status
+HTTP.headers
+HTTP.body
+HTTP.method
+HTTP.uri
+```
+

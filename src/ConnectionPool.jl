@@ -32,6 +32,7 @@ using ..IOExtras, ..Sockets
 import ..@debug, ..@debugshow, ..DEBUG_LEVEL, ..taskid
 import ..@require, ..precondition_error, ..@ensure, ..postcondition_error
 using MbedTLS: SSLConfig, SSLContext, setup!, associate!, hostname!, handshake!
+import NetworkOptions
 
 const default_connection_limit = 8
 const default_pipeline_limit = 16
@@ -522,6 +523,11 @@ struct Pool
     conns::Dict{UInt, Pod}
 end
 
+"""
+    POOL
+
+Global connection pool keeping track of active connections.
+"""
 const POOL = Pool(ReentrantLock(), Dict{UInt, Pod}())
 
 function getpod(pool::Pool, x)
@@ -543,7 +549,7 @@ function getconnection(::Type{Transaction{T}},
                        pipeline_limit::Int=default_pipeline_limit,
                        idle_timeout::Int=0,
                        reuse_limit::Int=nolimit,
-                       require_ssl_verification::Bool=true,
+                       require_ssl_verification::Bool=NetworkOptions.verify_host(host, "SSL"),
                        kw...)::Transaction{T} where T <: IO
     pod = getpod(POOL, hashconn(T, host, port, pipeline_limit, require_ssl_verification, true))
     @v1_3 lock(pod.conns)
@@ -648,37 +654,52 @@ function getconnection(::Type{TCPSocket},
 
     @debug 2 "TCP connect: $host:$p..."
 
+    addrs = Sockets.getalladdrinfo(host)
+
     connect_timeout = connect_timeout == 0 && readtimeout > 0 ? readtimeout : connect_timeout
-    if connect_timeout == 0
-        tcp = Sockets.connect(host == "localhost" ? ip"127.0.0.1" : Sockets.getalladdrinfo(host)[1], p)
-        keepalive && keepalive!(tcp)
-        return tcp
-    end
 
-    tcp = Sockets.TCPSocket()
-    Sockets.connect!(tcp, Sockets.getalladdrinfo(host)[1], p)
+    lasterr = ErrorException("unknown connection error")
 
-    timeout = Ref{Bool}(false)
-    @async begin
-        sleep(connect_timeout)
-        if tcp.status == Base.StatusConnecting
-            timeout[] = true
-            tcp.status = Base.StatusClosing
-            ccall(:jl_forceclose_uv, Nothing, (Ptr{Nothing},), tcp.handle)
-            #close(tcp)
+    for addr in addrs
+        if connect_timeout == 0
+            try
+                tcp = Sockets.connect(addr, p)
+                keepalive && keepalive!(tcp)
+                return tcp
+            catch err
+                lasterr = err
+                continue # to next ip addr
+            end
+        else
+            tcp = Sockets.TCPSocket()
+            Sockets.connect!(tcp, addr, p)
+
+            timeout = Ref{Bool}(false)
+            @async begin
+                sleep(connect_timeout)
+                if tcp.status == Base.StatusConnecting
+                    timeout[] = true
+                    tcp.status = Base.StatusClosing
+                    ccall(:jl_forceclose_uv, Nothing, (Ptr{Nothing},), tcp.handle)
+                    #close(tcp)
+                end
+            end
+            try
+                Sockets.wait_connected(tcp)
+                keepalive && keepalive!(tcp)
+                return tcp
+            catch err
+                if timeout[]
+                    lasterr = ConnectTimeout(host, port)
+                else
+                    lasterr = err
+                end
+                continue # to next ip addr
+            end
         end
     end
-    try
-        Sockets.wait_connected(tcp)
-    catch e
-        if timeout[]
-            throw(ConnectTimeout(host, port))
-        end
-        rethrow(e)
-    end
-
-    keepalive && keepalive!(tcp)
-    return tcp
+    # If no connetion could be set up, to any address, throw last error
+    throw(lasterr)
 end
 
 const nosslconfig = SSLConfig()
@@ -707,7 +728,7 @@ function getconnection(::Type{SSLContext},
 end
 
 function sslconnection(tcp::TCPSocket, host::AbstractString;
-                       require_ssl_verification::Bool=true,
+                       require_ssl_verification::Bool=NetworkOptions.verify_host(host, "SSL"),
                        sslconfig::SSLConfig=nosslconfig,
                        kw...)::SSLContext
 
@@ -725,7 +746,7 @@ end
 
 function sslupgrade(t::Transaction{TCPSocket},
                     host::AbstractString;
-                    require_ssl_verification::Bool=true,
+                    require_ssl_verification::Bool=NetworkOptions.verify_host(host, "SSL"),
                     kw...)::Transaction{SSLContext}
     tls = sslconnection(t.c.io, host;
                         require_ssl_verification=require_ssl_verification,

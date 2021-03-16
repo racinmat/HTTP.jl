@@ -15,8 +15,6 @@ HTTP.Parsers.parse_chunk_size
 ## Messages Interface
 
 ```@docs
-HTTP.Messages.Request
-HTTP.Messages.Response
 HTTP.Messages.iserror
 HTTP.Messages.isredirect
 HTTP.Messages.ischunked
@@ -58,8 +56,8 @@ HTTP.Streams.isaborted
 ```@docs
 HTTP.ConnectionPool.Connection
 HTTP.ConnectionPool.Transaction
-HTTP.ConnectionPool.pool
 HTTP.ConnectionPool.getconnection
+HTTP.ConnectionPool.POOL
 HTTP.IOExtras.startwrite(::HTTP.ConnectionPool.Transaction)
 HTTP.IOExtras.closewrite(::HTTP.ConnectionPool.Transaction)
 HTTP.IOExtras.startread(::HTTP.ConnectionPool.Transaction)
