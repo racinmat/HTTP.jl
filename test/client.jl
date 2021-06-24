@@ -3,6 +3,7 @@ using HTTP
 using Sockets
 using JSON
 using Test
+using URIs
 
 status(r) = r.status
 @testset "Custom HTTP Stack" begin
@@ -31,13 +32,13 @@ end
     end
 
     @testset "Query to URI" begin
-        r = HTTP.get(merge(HTTP.URI("$sch://httpbin.org/response-headers"); query=Dict("hey"=>"dude")))
+        r = HTTP.get(URI(HTTP.URI("$sch://httpbin.org/response-headers"); query=Dict("hey"=>"dude")))
         h = Dict(r.headers)
         @test (haskey(h, "Hey") ? h["Hey"] == "dude" : h["hey"] == "dude")
     end
 
     @testset "Cookie Requests" begin
-        empty!(HTTP.CookieRequest.default_cookiejar[1])
+        empty!(HTTP.access_threaded(Dict{String, Set{HTTP.Cookie}}, HTTP.CookieRequest.default_cookiejar))
         r = HTTP.get("$sch://httpbin.org/cookies", cookies=true)
 
         body = String(r.body)
@@ -213,7 +214,10 @@ end
 end
 
 @testset "readtimeout" begin
-    @test_throws HTTP.IOError HTTP.get("http://httpbin.org/delay/5"; readtimeout=1, retry=false)
+    @test_throws HTTP.TimeoutRequest.ReadTimeoutError begin
+        HTTP.get("http://httpbin.org/delay/5"; readtimeout=1, retry=false)
+    end
+    HTTP.get("http://httpbin.org/delay/1"; readtimeout=2, retry=false)
 end
 
 @testset "Retry all resolved IP addresses" begin
@@ -236,6 +240,60 @@ end
             @test String(req.body) == "hello, world"
         end
     end
+end
+
+@testset "Sockets.get(sock|peer)name(::HTTP.Stream)" begin
+    server = listen(IPv4(0), 8080)
+    @async HTTP.listen("0.0.0.0", 8080; server=server) do http
+        sock = Sockets.getsockname(http)
+        peer = Sockets.getpeername(http)
+        str = sprint() do io
+            print(io, sock[1], ":", sock[2], " - ", peer[1], ":", peer[2])
+        end
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Length" => string(sizeof(str)))
+        HTTP.startwrite(http)
+        HTTP.write(http, str)
+    end
+
+    # Tests for Stream{TCPSocket}
+    HTTP.open("GET", "http://localhost:8080") do http
+        # Test server peer/sock
+        reg = r"^127\.0\.0\.1:8080 - 127\.0\.0\.1:(\d+)$"
+        m = match(reg, read(http, String))
+        @test m !== nothing
+        server_peerport = parse(Int, m[1])
+        # Test client peer/sock
+        sock = Sockets.getsockname(http)
+        @test sock[1] == ip"127.0.0.1"
+        @test sock[2] == server_peerport
+        peer = Sockets.getpeername(http)
+        @test peer[1] == ip"127.0.0.1"
+        @test peer[2] == 8080
+    end
+
+    close(server)
+
+    # Tests for Stream{SSLContext}
+    HTTP.open("GET", "https://julialang.org") do http
+        sock = Sockets.getsockname(http)
+        if VERSION >= v"1.2.0"
+            @test sock[1] in Sockets.getipaddrs()
+        end
+        peer = Sockets.getpeername(http)
+        @test peer[1] in Sockets.getalladdrinfo("julialang.org")
+        @test peer[2] == 443
+    end
+end
+
+@testset "input verification of bad URLs" begin
+    # HTTP.jl#527, HTTP.jl#545
+    url = "julialang.org"
+    @test_throws ArgumentError("missing or unsupported scheme in URL (expected http(s) or ws(s)): $(url)") HTTP.get(url)
+    url = "ptth://julialang.org"
+    @test_throws ArgumentError("missing or unsupported scheme in URL (expected http(s) or ws(s)): $(url)") HTTP.get(url)
+    url = "http:julialang.org"
+    @test_throws ArgumentError("missing host in URL: $(url)") HTTP.get(url)
 end
 
 @testset "Implicit request headers" begin
@@ -348,5 +406,35 @@ end
         test(HTTP.delete(uri; headers=headers, body=body, query=query), "DELETE")
         test(HTTP.delete(uri, headers; body=body, query=query), "DELETE")
         test(HTTP.delete(uri, headers, body; query=query), "DELETE")
+    end
+end
+
+@testset "HTTP CONNECT Proxy" begin
+    @testset "Host header" begin
+        # Stores the http request passed by the client
+        req = String[]
+
+        # Trivial implementation of a proxy server
+        # We are only interested in the request passed in by the client
+        # Returns 400 after reading the http request into req
+        proxy = listen(IPv4(0), 8082)
+        @async begin
+            sock = accept(proxy)
+            while isopen(sock)
+                line = readline(sock)
+                isempty(line) && break
+
+                push!(req, line)
+            end
+            write(sock, "HTTP/1.1 400 Bad Request\r\n\r\n")
+        end
+
+        # Make the HTTP request
+        HTTP.get("https://example.com"; proxy="http://localhost:8082", retry=false, status_exception=false)
+
+        # Test if the host header exist in the request
+        @test "Host: example.com:443" in req
+
+        close(proxy)
     end
 end

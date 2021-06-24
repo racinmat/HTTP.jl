@@ -95,7 +95,7 @@ function request(::Type{ConnectionPoolLayer{Next}}, url::URI, req, body;
     try
         if proxy !== nothing && target_url.scheme == "https"
             # tunnel request
-            target_url = merge(target_url, port=443)
+            target_url = URI(target_url, port=443)
             r = connect_tunnel(io, target_url, req)
             if r.status != 200
                 close(io)
@@ -126,7 +126,10 @@ sockettype(url::URI, default) = url.scheme in ("wss", "https") ? SSLContext : de
 function connect_tunnel(io, target_url, req)
     target = "$(URIs.hoststring(target_url.host)):$(target_url.port)"
     @debug 1 "📡  CONNECT HTTPS tunnel to $target"
-    headers = Dict(filter(x->x.first == "Proxy-Authorization", req.headers))
+    headers = Dict("Host" => target)
+    if (auth = header(req, "Proxy-Authorization"); !isempty(auth))
+        headers["Proxy-Authorization"] = auth
+    end
     request = Request("CONNECT", target, headers)
     writeheaders(io, request)
     startread(io)

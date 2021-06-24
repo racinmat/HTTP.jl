@@ -23,7 +23,7 @@ import MbedTLS
 
 using Dates
 
-import ..@debug, ..@debugshow, ..DEBUG_LEVEL, ..taskid
+import ..@debug, ..@debugshow, ..DEBUG_LEVEL, ..taskid, ..access_threaded
 
 # rate limiting
 mutable struct RateLimit
@@ -36,10 +36,13 @@ function update!(rl::RateLimit, rate_limit)
     timepassed = float(Dates.value(current - rl.lastcheck)) / 1000.0
     rl.lastcheck = current
     rl.allowance += timepassed * rate_limit
+    if rl.allowance > rate_limit
+        rl.allowance = rate_limit
+    end
     return nothing
 end
 
-const RATE_LIMITS = [Dict{IPAddr, RateLimit}()]
+const RATE_LIMITS = Dict{IPAddr, RateLimit}[]
 check_rate_limit(tcp::Base.PipeEndpoint, rate_limit::Rational{Int}) = true
 check_rate_limit(tcp, ::Nothing) = true
 
@@ -51,14 +54,10 @@ soon, it is closed and discarded, otherwise, the timestamp for the
 ip address is updated in the global cache.
 """
 function check_rate_limit(tcp, rate_limit::Rational{Int})
-    ip = Sockets.getsockname(tcp)[1]
-    rate = Float64(rate_limit.num)
-    rl = get!(RATE_LIMITS[Threads.threadid()], ip, RateLimit(rate, Dates.now()))
+    ip = Sockets.getpeername(tcp)[1]
+    rl_d = access_threaded(Dict{IPAddr, RateLimit}, RATE_LIMITS)
+    rl = get!(rl_d, ip, RateLimit(rate_limit, Dates.DateTime(0)))
     update!(rl, rate_limit)
-    if rl.allowance > rate
-        @warn "throttling $ip"
-        rl.allowance = rate
-    end
     if rl.allowance < 1.0
         @warn "discarding connection from $ip due to rate limiting"
         return false
@@ -75,7 +74,10 @@ struct Server{S <: Union{SSLConfig, Nothing}, I <: Base.IOServer}
     hostname::String
     hostport::String
     on_shutdown::Any
+    access_log::Union{Function,Nothing}
 end
+Server(ssl, server, hostname, hostport, on_shutdown) =
+    Server(ssl, server, hostname, hostport, on_shutdown, nothing)
 
 Base.isopen(s::Server) = isopen(s.server)
 Base.close(s::Server) = (shutdown(s.on_shutdown); close(s.server))
@@ -144,6 +146,10 @@ Optional keyword arguments:
     allowed per client IP address; excess connections are immediately closed.
     e.g. 5//1.
  - `verbose::Bool=false`, log connection information to `stdout`.
+ - `access_log::Function`, function for formatting access log messages. The
+    function should accept two arguments, `io::IO` to which the messages should
+    be written, and `http::HTTP.Stream` which can be used to query information
+    from. See also [`@logfmt_str`](@ref).
  - `on_shutdown::Union{Function, Vector{<:Function}, Nothing}=nothing`, one or
     more functions to be run if the server is closed (for example by an
     `InterruptException`). Note, shutdown function(s) will not run if a
@@ -235,6 +241,7 @@ function listen(f,
                 reuse_limit::Int=nolimit,
                 readtimeout::Int=0,
                 verbose::Bool=false,
+                access_log::Union{Function,Nothing}=nothing,
                 on_shutdown::Union{Function, Vector{<:Function}, Nothing}=nothing)
 
     inet = getinet(host, port)
@@ -263,7 +270,7 @@ function listen(f,
         x -> f(x) && check_rate_limit(x, rate_limit)
     end
 
-    s = Server(sslconfig, tcpserver, string(host), string(port), on_shutdown)
+    s = Server(sslconfig, tcpserver, string(host), string(port), on_shutdown, access_log)
     return listenloop(f, s, tcpisvalid, connection_count, max_connections,
                          reuse_limit, readtimeout, verbose)
 end
@@ -423,13 +430,16 @@ function handle_transaction(f, t::Transaction, server; final_transaction::Bool=f
         end
         final_transaction = true
     finally
+        if server.access_log !== nothing
+            try @info sprint(server.access_log, http) _group=:access; catch end
+        end
         final_transaction && close(t.c.io)
     end
     return
 end
 
 function __init__()
-    Threads.resize_nthreads!(RATE_LIMITS)
+    resize!(empty!(RATE_LIMITS), Threads.nthreads())
     return
 end
 

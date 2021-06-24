@@ -22,6 +22,7 @@ mutable struct Stream{M <: Message, S <: IO} <: IO
     readchunked::Bool
     warn_not_to_read_one_byte_at_a_time::Bool
     ntoread::Int
+    nwritten::Int
 end
 
 """
@@ -49,7 +50,7 @@ Creates a `HTTP.Stream` that wraps an existing `IO` stream.
     response to be read by another `Stream` that is waiting in `startread`.
     If a complete response has not been received, `closeread` throws `EOFError`.
 """
-Stream(r::M, io::S) where {M, S} = Stream{M,S}(r, io, false, false, true, 0)
+Stream(r::M, io::S) where {M, S} = Stream{M,S}(r, io, false, false, true, 0, 0)
 
 header(http::Stream, a...) = header(http.message, a...)
 setstatus(http::Stream, status) = (http.message.response.status = status)
@@ -57,6 +58,13 @@ setheader(http::Stream, a...) = setheader(http.message.response, a...)
 getrawstream(http::Stream) = getrawstream(http.stream)
 
 Sockets.getsockname(http::Stream) = Sockets.getsockname(getrawstream(http))
+function Sockets.getpeername(http::Stream)
+    # TODO: MbedTLS only forwards getsockname(::SSLContext)
+    # so we use IOExtras.tcpsocket to reach into the MbedTLS internals
+    # for now to keep compatibility with older MbedTLS versions.
+    # return Sockets.getpeername(getrawstream(http))
+    return Sockets.getpeername(IOExtras.tcpsocket(getrawstream(http)))
+end
 
 IOExtras.isopen(http::Stream) = isopen(http.stream)
 
@@ -84,7 +92,9 @@ function IOExtras.startwrite(http::Stream)
     end
     buf = IOBuffer()
     writeheaders(buf, m)
-    write(http.stream, take!(buf))
+    n = write(http.stream, take!(buf))
+    http.nwritten = 0 # should not include headers
+    return n
 end
 
 function Base.unsafe_write(http::Stream, p::Ptr{UInt8}, n::UInt)
@@ -94,12 +104,15 @@ function Base.unsafe_write(http::Stream, p::Ptr{UInt8}, n::UInt)
     if !iswritable(http) && isopen(http.stream)
         startwrite(http)
     end
-    if !http.writechunked
-        return unsafe_write(http.stream, p, n)
+    nw = if !http.writechunked
+        unsafe_write(http.stream, p, n)
+    else
+        write(http.stream, string(n, base=16), "\r\n") +
+        unsafe_write(http.stream, p, n) +
+        write(http.stream, "\r\n")
     end
-    return write(http.stream, string(n, base=16), "\r\n") +
-           unsafe_write(http.stream, p, n) +
-           write(http.stream, "\r\n")
+    http.nwritten += nw
+    return nw
 end
 
 """

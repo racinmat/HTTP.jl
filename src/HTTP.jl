@@ -3,7 +3,8 @@ module HTTP
 export startwrite, startread, closewrite, closeread, stack, insert, insert_default!,
     remove_default!, AWS4AuthLayer, BasicAuthLayer, CanonicalizeLayer, ConnectionPoolLayer,
     ContentTypeDetectionLayer, DebugLayer, ExceptionLayer, MessageLayer, RedirectLayer,
-    RetryLayer, StreamLayer, TimeoutLayer
+    RetryLayer, StreamLayer, TimeoutLayer,
+    @logfmt_str, common_logfmt, combined_logfmt
 
 const DEBUG_LEVEL = Ref(0)
 
@@ -12,7 +13,21 @@ Base.@deprecate escape escapeuri
 using Base64, Sockets, Dates
 using URIs
 
+function access_threaded(f, v::Vector)
+    tid = Threads.threadid()
+    0 < tid <= length(v) || _length_assert()
+    if @inbounds isassigned(v, tid)
+        @inbounds x = v[tid]
+    else
+        x = f()
+        @inbounds v[tid] = x
+    end
+    return x
+end
+@noinline _length_assert() =  @assert false "0 < tid <= v"
+
 include("debug.jl")
+include("access_log.jl")
 
 include("Pairs.jl")                    ;using .Pairs
 include("IOExtras.jl")                 ;using .IOExtras
